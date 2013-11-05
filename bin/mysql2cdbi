@@ -1,0 +1,191 @@
+#!/usr/bin/perl
+###############################################################################
+# by Valcho Nedelchev
+# at https://github.com/valchonedelchev/mysql2cdbi
+# TODO:
+#   - option camel case table names, default is snake case
+#   - option for destination directory, by default is current dir
+###############################################################################
+use DBI;
+use strict;
+use warnings;
+use File::Slurp;
+use Getopt::Long;
+
+use constant EOL => "\n";
+use constant DEFAULT_BASENAME => 'DBI';
+use constant DEFAULT_PACKAGE => 'Model';
+
+my $VERSION = '0.05';
+
+# class-dbi generate
+GetOptions(
+    \my %opt,  "user=s",      "pass=s",     "database=s",
+    "table=s", "namespace=s", "help",       "version",
+    "nobase",  "package=s",   "basename=s", "abstract-search"
+);
+
+if ( $opt{help} or not keys %opt ) {
+    &usage;
+}
+
+if ( $opt{version} ) {
+    print EOL . "[version] $0 version is $VERSION" . EOL . EOL;
+    exit;
+}
+
+if ( not $opt{user} ) {
+    $opt{user} = 'root';
+}
+
+if ( not $opt{pass} ) {
+    print "Please, enter your password [not visible on terminal]: ";
+    system( '/bin/stty', '-echo' );
+    chomp( $opt{pass} = <STDIN> );
+    system( '/bin/stty', 'echo' );
+    print "\n";
+}
+
+my $dbh =
+  DBI->connect( "dbi:mysql:" . $opt{'database'}, $opt{'user'}, $opt{'pass'} )
+  or exit 1;
+{
+    my @tables;
+    if ( exists $opt{'table'} ) {
+        @tables = ( $opt{'table'} );
+    } else {
+        @tables = get_all_tables();
+    }
+
+    my $basename = $opt{'basename'} || DEFAULT_BASENAME;
+    my $package  = $opt{'package'}  || DEFAULT_PACKAGE;
+
+    $basename =~ s{\..*?$}{} if $basename =~ m{\.};    # remove file extension
+    my $pkgdir = $package;
+    $pkgdir =~ s{::}{/}g;
+
+    if ( not -d $pkgdir ) {
+        system( "mkdir", "-p", $pkgdir ) == 0
+          or die 'Failed to mkdir Model - $!';
+        print " Created $pkgdir/\n";
+    }
+
+    if ( not $opt{nobase} ) {
+        my $code =
+          gen_dbi_base( $opt{user}, $opt{pass}, $opt{database}, $package, $basename );
+        my $file = "$pkgdir/$basename.pm";
+        write_file( $file, $code );
+        print " Created file $file" . EOL;
+    }
+
+    foreach my $table (@tables) {
+        my @fields = get_fields($table);
+        my $code =
+          get_code( $opt{database}, $table, \@fields, $package,
+            $opt{'abstract-search'}, $basename );
+        my $file = $pkgdir . '/' . ucfirst( lc $table ) . '.pm';
+        write_file( $file, $code );
+        print " Created file $file" . EOL;
+    }
+}
+$dbh->disconnect;
+
+# todo: add support for drivers
+sub gen_dbi_base
+{
+    my ( $username, $password, $database, $package, $basename ) = @_;
+    $package = $package ? $package . '::' . $basename : DEFAULT_PACKAGE . '::' . $basename;
+    my $o = 'package ' . $package . ';' . EOL;
+    $o .= 'use base qw/Class::DBI/;' . EOL . EOL;
+    $o .= 'our $VERSION = "0.1";' . EOL . EOL;
+    $o .= sprintf( '%s->connection(' . EOL, $package );
+    $o .= sprintf( '  "dbi:mysql:%s",' . EOL, $database );
+    $o .= sprintf( '  "%s",' . EOL, $username );
+    $o .= sprintf( '  "%s",' . EOL, $password );
+    $o .= sprintf( ' { mysql_enable_utf8 => 1 } );' . EOL . EOL );
+    $o .= '1;' . EOL . EOL;
+    return $o;
+}
+
+sub get_code
+{
+    my ( $database, $table, $fields, $package, $abstract_search, $basename ) = @_;
+
+    my @fields = @$fields;
+
+    $package = $package || DEFAULT_PACKAGE;
+    my $base  = $package . '::' . $basename;
+    $package .= '::' . ucfirst( lc $table );
+
+    my $o = 'package ' . $package . ';' . EOL;
+    $o .= 'use base qw/' . $base . '/;' . EOL;
+    $o .= 'use Class::DBI::AbstractSearch;' . EOL if $abstract_search;
+    $o .= 'our $VERSION = "0.01";' . EOL;
+    $o .= $package . '->table("' . $table . '");' . EOL;
+    $o .=
+      $package . "->columns(All => qw/\n  " . join( "\n  ", @fields ) . "\n/);" . EOL;
+    $o .= EOL . '1;' . EOL;
+    $o .= EOL . '__END__' . EOL;
+    $o .= EOL . "=head1 NAME" . EOL;
+    $o .= EOL . $package . EOL;
+    $o .= EOL . "=head1 DESCRIPTION" . EOL;
+    $o .= EOL . "This class was generated from $database.$table." . EOL . EOL;
+    $o .= '=head1 CREATE TABLE DEFINITION' . EOL . EOL;
+    $o .= get_create_definition($table);
+    $o .= EOL . EOL;
+    $o .= '=cut' . EOL . EOL;
+
+    return $o;
+}
+
+sub get_fields
+{
+    my $tbl = shift;
+    my $sth = $dbh->prepare("describe $tbl");
+    $sth->execute;
+    my @cols = map { $_->[0] } @{ $sth->fetchall_arrayref };
+    $sth->finish;
+    return @cols;
+}
+
+sub get_all_tables
+{
+    my $sth = $dbh->prepare( "show table status from " . $opt{database} );
+    $sth->execute;
+    return map { $_->{Name} } values %{ $sth->fetchall_hashref('Name') };
+}
+
+sub get_create_definition
+{
+    my $table = shift;
+    my $sth   = $dbh->prepare("show create table $table");
+    $sth->execute;
+    my $row = $sth->fetchrow_arrayref;
+    $sth->finish;
+    return $row->[1];
+}
+
+sub usage
+{
+    my $message = shift;
+    print $message . EOL;
+    print "usage: $0 -user=root -pass=******* -database=blog" . EOL;
+    print "  -user            - MySQL username (default is root)" . EOL;
+    print "  -pass            - MySQL password" . EOL;
+    print "  -database        - MySQL database name" . EOL;
+    print "  -table           - MySQL table ( or will generate for all tables)"
+      . EOL;
+    print "  -nobase          - do not create connection class" . EOL;
+    print "  -version         - print out this program version" . EOL;
+    print "  -help            - print this help" . EOL;
+    print "  -package         - alternative package name (default is Model)"
+      . EOL;
+    print
+"  -abstract-search - add use Class::DBI::AbstractSearch to enable search_where()"
+      . EOL;
+    print
+"  -basename        - alternative name for connection base class (default is DBI.pm)"
+      . EOL;
+    exit;
+}
+
